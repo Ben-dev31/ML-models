@@ -22,3 +22,17 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.bmp
+*.tiff
+*.json
+*.pth
+*.pt
+*.ckpt
+*.bin
+__build/
+__pycache__/
+*.log

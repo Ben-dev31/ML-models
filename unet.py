@@ -1,7 +1,8 @@
 # unet_trainable.py
 import os
 from pathlib import Path
-from typing import Optional, Tuple, List
+from typing import Optional, Tuple, List, Any
+import json
 
 import torch
 import torch.nn as nn
@@ -10,13 +11,21 @@ from torchvision import transforms
 from PIL import Image
 import numpy as np
 from torch.cuda.amp import autocast, GradScaler
+import torch.nn.functional as F
+from tqdm import tqdm
+import torchvision.transforms as T
+import cv2
 
 # ----------------------------
-# 1) Architecture U-Net
+# Architecture U-Net
 # ----------------------------
 class DoubleConv(nn.Module):
     """(conv => BN => ReLU) * 2"""
     def __init__(self, in_ch, out_ch, mid_ch: Optional[int] = None):
+        """
+        mid_ch: intermediate channels; if None, set to out_ch
+
+        """
         super().__init__()
         if not mid_ch:
             mid_ch = out_ch
@@ -75,40 +84,226 @@ class OutConv(nn.Module):
         return self.conv(x)
 
 class UNet(nn.Module):
-    def __init__(self, n_channels: int, n_classes: int, base_c: int = 64, bilinear: bool = True):
-        super().__init__()
-        self.n_channels = n_channels
-        self.n_classes = n_classes
-        self.bilinear = bilinear
+    def __init__(self, in_channels=3, out_channels=1, device=None, input_size: Tuple[int,int]=(256,256)):
+        super(UNet, self).__init__()
 
-        self.inc = DoubleConv(n_channels, base_c)
-        self.down1 = Down(base_c, base_c*2)
-        self.down2 = Down(base_c*2, base_c*4)
-        self.down3 = Down(base_c*4, base_c*8)
-        self.down4 = Down(base_c*8, base_c*8)  # bottom (no further increase)
+        self.history = {}
+        # store dynamic attributes
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.input_size = input_size
+        
+        # Encodeur
+        self.conv1 = DoubleConv(in_channels, 64)
+        self.pool1 = nn.MaxPool2d(2)
+        self.conv2 = DoubleConv(64, 128)
+        self.pool2 = nn.MaxPool2d(2)
+        self.conv3 = DoubleConv(128, 256)
+        self.pool3 = nn.MaxPool2d(2)
+        self.conv4 = DoubleConv(256, 512)
+        self.pool4 = nn.MaxPool2d(2)
 
-        self.up1 = Up(base_c*16, base_c*4, bilinear)
-        self.up2 = Up(base_c*8, base_c*2, bilinear)
-        self.up3 = Up(base_c*4, base_c, bilinear)
-        self.up4 = Up(base_c*2, base_c, bilinear)
-        self.outc = OutConv(base_c, n_classes)
+        # Bottleneck
+        self.bottleneck = DoubleConv(512, 1024)
+
+        # Décodeur
+        self.upconv4 = nn.ConvTranspose2d(1024, 512, kernel_size=2, stride=2)
+        self.conv_up4 = DoubleConv(1024, 512)
+
+        self.upconv3 = nn.ConvTranspose2d(512, 256, kernel_size=2, stride=2)
+        self.conv_up3 = DoubleConv(512, 256)
+
+        self.upconv2 = nn.ConvTranspose2d(256, 128, kernel_size=2, stride=2)
+        self.conv_up2 = DoubleConv(256, 128)
+
+        self.upconv1 = nn.ConvTranspose2d(128, 64, kernel_size=2, stride=2)
+        self.conv_up1 = DoubleConv(128, 64)
+
+        # Sortie
+        self.final_conv = nn.Conv2d(64, out_channels, kernel_size=1)
+
+        # Gestion du GPU
+        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
 
     def forward(self, x):
-        x1 = self.inc(x)      # [B, base_c, H, W]
-        x2 = self.down1(x1)   # [B, base_c*2, H/2, W/2]
-        x3 = self.down2(x2)   # ...
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        # decoder
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        return logits  # raw logits; apply sigmoid for binary
+        # Encodeur
+        x1 = self.conv1(x)
+        x2 = self.conv2(self.pool1(x1))
+        x3 = self.conv3(self.pool2(x2))
+        x4 = self.conv4(self.pool3(x3))
+        x5 = self.bottleneck(self.pool4(x4))
+
+        # Décodeur
+        x = self.upconv4(x5)
+        x = self.conv_up4(torch.cat([x, x4], dim=1))
+        x = self.upconv3(x)
+        x = self.conv_up3(torch.cat([x, x3], dim=1))
+        x = self.upconv2(x)
+        x = self.conv_up2(torch.cat([x, x2], dim=1))
+        x = self.upconv1(x)
+        x = self.conv_up1(torch.cat([x, x1], dim=1))
+
+        return self.final_conv(x)
+    
+    def save_history(self, history: dict, save_path: str):
+        """
+        Sauvegarde l'historique d'entraînement dans un fichier .pth
+
+        Args:
+            history (dict) : dictionnaire contenant l'historique (ex: {'loss': [...], 'val_loss': [...]})
+            save_path (str) : chemin du fichier de sauvegarde
+        """
+        with open(save_path, "w") as f:
+            json.dump(history, f)
+
+    def train_model(self, train_loader,val_loader, epochs=10, lr=1e-4, criterion=None, save_dir: str = "./checkpoints"):
+        """
+        Entraîne le modèle sur un DataLoader contenant des couples (image, masque).
+
+        Args:
+            train_loader : torch.utils.data.DataLoader
+            epochs (int) : nombre d'époques
+            lr (float) : taux d'apprentissage
+            criterion : fonction de perte (par défaut BCEWithLogitsLoss)
+        """
+        optimizer = torch.optim.Adam(self.parameters(), lr=lr)
+        criterion = criterion or nn.BCEWithLogitsLoss()
+
+        save_dir = Path(save_dir)
+        save_dir.mkdir(exist_ok=True)
+
+        for epoch in range(epochs):
+            self.train()
+            epoch_loss = 0.0
+            n_batches = 0
+            for images, masks in tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs}"):
+                images = images.to(self.device, dtype=torch.float32)
+                masks = masks.to(self.device, dtype=torch.float32)
+                optimizer.zero_grad()
+                outputs = self(images)
+                loss = criterion(outputs, masks)
+                loss.backward()
+                optimizer.step()
+                epoch_loss += loss.item()
+                n_batches += 1
+
+            epoch_loss_avg = epoch_loss / max(1, n_batches)
+            val_loss = self.validate(val_loader, criterion)
+            # append averaged epoch metrics
+            self.history.setdefault('loss', []).append(epoch_loss_avg)
+            self.history.setdefault('val_loss', []).append(val_loss)
+
+            # checkpoint dict (compatible with load_checkpoint below)
+            ckpt = {
+                'epoch': epoch + 1,
+                'model_state': self.state_dict(),
+                'opt_state': optimizer.state_dict(),
+                'val_loss': val_loss
+            }
+            ckpt_path = save_dir / f"unet_epoch{epoch+1}.pth"
+            torch.save(self.state_dict(), ckpt_path)
+
+            print(f"Epoch {epoch+1}/{epochs} - Loss: {epoch_loss_avg:.4f} - Val Loss: {val_loss:.4f}")
+
+        print("Entraînement terminé.")
+        # save history as JSON for human-readability
+        self.save_history(self.history, "training_history.json")
+    
+    def validate(self, val_loader, criterion=None):
+        """
+        Évalue le modèle sur un DataLoader de validation.
+
+        Args:
+            val_loader : torch.utils.data.DataLoader
+            criterion : fonction de perte (par défaut BCEWithLogitsLoss)
+
+        Returns:
+            float : perte moyenne sur le jeu de validation
+        """
+        self.eval()
+        criterion = criterion or nn.BCEWithLogitsLoss()
+        val_loss = 0.0
+        n = 0
+        with torch.no_grad():
+            for images, masks in val_loader:
+                images = images.to(self.device, dtype=torch.float32)
+                masks = masks.to(self.device, dtype=torch.float32)
+                outputs = self(images)
+                loss = criterion(outputs, masks)
+                val_loss += loss.item()
+                n += 1
+        return val_loss / max(1, n)
+    
+    def prepare_image(self, image_input, color_order: str = 'RGB'):
+        """
+        Prépare une image pour la prédiction.
+        Accepte :
+            - chemin vers une image (str)
+            - numpy.ndarray (RGB ou BGR)
+            - PIL.Image
+        
+        Retourne :
+            torch.Tensor de forme [1, 3, H, W]
+        """
+        if isinstance(image_input, str):
+            # Chargement depuis un chemin
+            img = Image.open(image_input).convert("RGB")
+            transform = T.Compose([
+                T.Resize(self.input_size),
+                T.ToTensor()
+            ])
+            img_tensor = transform(img).unsqueeze(0)
+
+        elif isinstance(image_input, np.ndarray):
+            img = image_input
+            if img.ndim == 2:
+                img = np.stack([img] * 3, axis=-1)
+            # Assume provided numpy is RGB by default. If BGR, user can set color_order='BGR'.
+            if color_order.upper() == 'BGR' and img.shape[2] == 3:
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            img = cv2.resize(img, tuple(self.input_size[::-1]))  # cv2 expects (w,h)
+            img_tensor = torch.from_numpy(img).permute(2, 0, 1).float() / 255.0
+            img_tensor = img_tensor.unsqueeze(0)
+
+        elif isinstance(image_input, Image.Image):
+            transform = T.Compose([
+                T.Resize(self.input_size),
+                T.ToTensor()
+            ])
+            img_tensor = transform(image_input).unsqueeze(0)
+
+        else:
+            raise TypeError("Format d'image non reconnu. Utilise un chemin, un numpy.ndarray ou un PIL.Image.")
+
+        return img_tensor
+
+    
+    def predict(self, image_input, threshold=0.5, return_numpy: bool = True, color_order: str = 'RGB'):
+        """
+        Prédit un masque à partir d'une image.
+        Accepte :
+            - chemin vers une image
+            - numpy.ndarray
+            - PIL.Image
+        """
+        self.eval()
+        with torch.no_grad():
+            # Préparer l'image automatiquement
+            img_tensor = self.prepare_image(image_input, color_order=color_order).to(self.device)
+
+            output = self(img_tensor)
+            probs = torch.sigmoid(output)
+            mask = (probs > threshold).float()
+        mask = mask.cpu().squeeze(0)  # remove batch dim; shape [C,H,W] or [H,W] if C==1
+        if return_numpy:
+            return mask.squeeze().numpy()
+        return mask
+
+
 
 # ----------------------------
-# 2) Dataset
+# Dataset
 # ----------------------------
 class SegmentationDataset(Dataset):
     """
@@ -117,11 +312,14 @@ class SegmentationDataset(Dataset):
     - masks: single-channel masks (0 background, 255 object) or multi-class index maps
     Both must have same filenames.
     """
-    def __init__(self, images_dir: str, masks_dir: str, transform=None):
+    def __init__(self, images_dir: str, masks_dir: str, transform=None, target_size: Optional[Tuple[int,int]] = None):
         self.images_dir = Path(images_dir)
-        self.masks_dir = Path(masks_dir)
+        self.masks_dir = Path(masks_dir) if masks_dir else None
         self.transform = transform
-        self.files = sorted([p.name for p in self.images_dir.iterdir() if p.is_file()])
+        self.target_size = target_size
+        # only keep common image extensions
+        valid_exts = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
+        self.files = sorted([p.name for p in self.images_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts])
 
     def __len__(self):
         return len(self.files)
@@ -129,23 +327,43 @@ class SegmentationDataset(Dataset):
     def __getitem__(self, idx):
         fname = self.files[idx]
         img_path = self.images_dir / fname
-        mask_path = self.masks_dir / fname  # assumes same name; adapt if suffix differs
+        # Try to find mask with the same stem but any common extension
+        stem = Path(fname).stem
+        mask_path = None
+        if self.masks_dir is not None:
+            for p in self.masks_dir.iterdir():
+                if p.is_file() and p.stem == stem:
+                    mask_path = p
+                    break
+            if mask_path is None:
+                # fallback: same filename (may raise later)
+                mask_path = self.masks_dir / fname
+
         image = Image.open(img_path).convert("RGB")
-        mask = Image.open(mask_path).convert("L")  # grayscale mask
+        if mask_path:
+            mask = Image.open(mask_path).convert("L")  # grayscale mask
         if self.transform:
             sample = self.transform(image=np.array(image), mask=np.array(mask))
             image = sample['image']
             mask = sample['mask']
         else:
-            # minimal transform: to tensor + normalize
-            tf = transforms.Compose([
-                transforms.ToTensor(),  # [0,1]
-            ])
+            # minimal transform: resize (if requested) -> to tensor + normalize
+            tf_list = []
+            if self.target_size:
+                tf_list.append(transforms.Resize(self.target_size))
+            tf_list.append(transforms.ToTensor())
+            tf = transforms.Compose(tf_list)
             image = tf(image)
+
+            # resize mask using PIL nearest if required
+            if self.target_size:
+                mask = mask.resize(self.target_size, resample=Image.NEAREST)
             mask = np.array(mask, dtype=np.uint8)
             mask = torch.from_numpy(mask).unsqueeze(0).float() / 255.0  # [0,1], shape [1,H,W]
 
         return image, mask
+    
+   
 
 # Example of a simple torchvision transform (no albumentations):
 def make_basic_transform(target_size: Tuple[int,int]=(256,256)):
@@ -155,150 +373,40 @@ def make_basic_transform(target_size: Tuple[int,int]=(256,256)):
     ])
 # If you want synchronized augmentations for image+mask, prefer albumentations (not used here).
 
-# ----------------------------
-# 3) Losses & Metrics
-# ----------------------------
-def dice_coeff(pred: torch.Tensor, target: torch.Tensor, eps=1e-7):
-    # pred and target are tensors with values in [0,1], shape [B,1,H,W]
-    B = pred.shape[0]
-    pred_flat = pred.view(B, -1)
-    target_flat = target.view(B, -1)
-    intersection = (pred_flat * target_flat).sum(dim=1)
-    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1)
-    dice = (2. * intersection + eps) / (union + eps)
-    return dice.mean()
 
-class DiceLoss(nn.Module):
-    def __init__(self, eps=1e-7):
-        super().__init__()
-        self.eps = eps
-    def forward(self, logits, target):
-        # logits: raw (not sigmoid). target in {0,1}
-        probs = torch.sigmoid(logits)
-        dice = dice_coeff(probs, target, eps=self.eps)
-        return 1.0 - dice
-
-def iou_score(pred: torch.Tensor, target: torch.Tensor, thr=0.5, eps=1e-7):
-    pred_bin = (pred > thr).float()
-    B = pred_bin.shape[0]
-    pred_flat = pred_bin.view(B, -1)
-    target_flat = target.view(B, -1)
-    inter = (pred_flat * target_flat).sum(dim=1)
-    union = pred_flat.sum(dim=1) + target_flat.sum(dim=1) - inter
-    iou = (inter + eps) / (union + eps)
-    return iou.mean()
-
-# ----------------------------
-# 4) Training loop
-# ----------------------------
-def train_one_epoch(model, loader, optimizer, device, scaler, criterion_bce, criterion_dice, epoch, log_interval=50):
-    model.train()
-    running_loss = 0.0
-    for i, (images, masks) in enumerate(loader):
-        images = images.to(device, dtype=torch.float32)
-        masks = masks.to(device, dtype=torch.float32)  # shape [B,1,H,W]
-
-        optimizer.zero_grad()
-        with autocast():
-            logits = model(images)
-            # if logits shape [B, C, H, W], for binary keep C=1
-            loss_bce = criterion_bce(logits, masks)
-            loss_dice = criterion_dice(logits, masks)
-            loss = 0.5 * loss_bce + 0.5 * loss_dice
-
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-
-        running_loss += loss.item()
-        if (i + 1) % log_interval == 0:
-            print(f"Epoch {epoch} Step {i+1}/{len(loader)} - loss: {running_loss / (i+1):.4f}")
-
-    avg_loss = running_loss / len(loader)
-    return avg_loss
-
-def validate(model, loader, device, criterion_bce, criterion_dice):
+def validate(model, loader, device, metric):
     model.eval()
     val_loss = 0.0
-    dice_meter = 0.0
+    metric_meter = 0.0
     iou_meter = 0.0
     with torch.no_grad():
         for images, masks in loader:
             images = images.to(device, dtype=torch.float32)
             masks = masks.to(device, dtype=torch.float32)
             logits = model(images)
-            loss = 0.5 * criterion_bce(logits, masks) + 0.5 * criterion_dice(logits, masks)
+            loss = metric(logits, masks) 
             val_loss += loss.item()
 
             probs = torch.sigmoid(logits)
-            dice_meter += dice_coeff(probs, masks).item()
-            iou_meter += iou_score(probs, masks).item()
+            metric_meter += metric(probs, masks).item()
 
     n = len(loader)
-    return val_loss / n, dice_meter / n, iou_meter / n
+    return val_loss / n, metric_meter / n, iou_meter / n
 
-# ----------------------------
-# 5) Run training (example)
-# ----------------------------
-def run_training(
-    images_train_dir: str,
-    masks_train_dir: str,
-    images_val_dir: str,
-    masks_val_dir: str,
-    epochs: int = 50,
-    batch_size: int = 8,
-    lr: float = 1e-4,
-    device: Optional[str] = None,
-    save_dir: str = "./checkpoints",
-):
-    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device:", device)
-    os.makedirs(save_dir, exist_ok=True)
 
-    # Datasets & loaders (you can replace transforms with albumentations for stronger augmentation)
-    train_ds = SegmentationDataset(images_train_dir, masks_train_dir, transform=None)
-    val_ds = SegmentationDataset(images_val_dir, masks_val_dir, transform=None)
-
-    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, num_workers=4, pin_memory=True)
-    val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False, num_workers=2, pin_memory=True)
-
-    model = UNet(n_channels=3, n_classes=1, base_c=64, bilinear=True).to(device)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=3)
-    scaler = GradScaler()
-    criterion_bce = nn.BCEWithLogitsLoss()
-    criterion_dice = DiceLoss()
-
-    best_val_loss = float('inf')
-    for epoch in range(1, epochs + 1):
-        train_loss = train_one_epoch(model, train_loader, optimizer, device, scaler, criterion_bce, criterion_dice, epoch)
-        val_loss, val_dice, val_iou = validate(model, val_loader, device, criterion_bce, criterion_dice)
-        scheduler.step(val_loss)
-
-        print(f"Epoch {epoch} -> train_loss: {train_loss:.4f} | val_loss: {val_loss:.4f} | val_dice: {val_dice:.4f} | val_iou: {val_iou:.4f}")
-
-        # save checkpoint
-        ckpt = {
-            'epoch': epoch,
-            'model_state': model.state_dict(),
-            'opt_state': optimizer.state_dict(),
-            'scaler': scaler.state_dict(),
-            'val_loss': val_loss
-        }
-        torch.save(ckpt, os.path.join(save_dir, f"checkpoint_epoch{epoch}.pth"))
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
-            torch.save(ckpt, os.path.join(save_dir, "best.pth"))
-            print("Saved best checkpoint.")
-
-    print("Training finished.")
-
-# If you want to load a checkpoint:
 def load_checkpoint(model: nn.Module, ckpt_path: str, optimizer: Optional[torch.optim.Optimizer]=None, scaler: Optional[GradScaler]=None):
     ckpt = torch.load(ckpt_path, map_location='cpu')
-    model.load_state_dict(ckpt['model_state'])
-    if optimizer and 'opt_state' in ckpt:
-        optimizer.load_state_dict(ckpt['opt_state'])
-    if scaler and 'scaler' in ckpt:
-        scaler.load_state_dict(ckpt['scaler'])
-    return ckpt.get('epoch', None), ckpt.get('val_loss', None)
+    # support two formats:
+    # 1) {'model_state': ..., 'opt_state': ..., 'epoch':..., 'val_loss':...}
+    # 2) state_dict (legacy)
+    if isinstance(ckpt, dict) and 'model_state' in ckpt:
+        model.load_state_dict(ckpt['model_state'])
+        if optimizer and 'opt_state' in ckpt:
+            optimizer.load_state_dict(ckpt['opt_state'])
+        if scaler and 'scaler' in ckpt:
+            scaler.load_state_dict(ckpt['scaler'])
+        return ckpt.get('epoch', None), ckpt.get('val_loss', None)
+    else:
+        # assume ckpt is a state_dict
+        model.load_state_dict(ckpt)
+        return None, None
