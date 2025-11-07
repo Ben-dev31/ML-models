@@ -137,15 +137,14 @@ def run_prediction(model_path: str, images_dir: str, out_masks_dir: str, device=
                 pred_mask = preds[j, 0].cpu().numpy() * 255
                 pred_img = Image.fromarray(pred_mask.astype(np.uint8))
                 pred_img.save(out_masks_dir / img_names[j])
-
-    print(f"Prediction completed. Masks saved to {out_masks_dir}")
-
     # Evaluate if ground-truth masks are available
     gt_masks_dir = Path(images_dir).parent / 'masks'
     if gt_masks_dir.exists():
         print("Ground-truth masks directory found, running evaluation...")
         evaluate_model(model_path, images_dir, str(gt_masks_dir), device=device, batch_size=batch_size, target_size=model_target)
     
+    print(f"Prediction completed. Masks saved to {out_masks_dir}")
+
 
 def evaluate_model(model_path: str, images_dir: str, masks_dir: str, device=None, batch_size: int = 4, threshold: float = 0.5, target_size: Optional[Tuple[int,int]] = None):
     """Evaluate model predictions against ground-truth masks.
