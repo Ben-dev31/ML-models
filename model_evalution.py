@@ -1,18 +1,12 @@
 
-from unet import UNet, SegmentationDataset
 from losses_metrics import DiceLoss, dice_coeff, iou_score
-import torch
 
 from pathlib import Path
-from PIL import Image
-import numpy as np
-from torch.utils.data import DataLoader
-from torchvision import transforms
-from utils import PredictionDataset, save_in_history
-from typing import Optional, Tuple
+from utils import save_in_history
+from typing import Optional
 from model_test import run_prediction, evaluate_model
 from model_full_train import run_full_train
-from losses_metrics import FoclssLoss, DiceLoss
+from losses_metrics import FocalLoss, DiceLoss
 from plot_loss import plot_loss , load_loss_history
 
 # pipeline to evaluate model on a dataset and compute metrics
@@ -81,7 +75,7 @@ if __name__ == "__main__":
                    device=args.device,
                      loss_fns={
                           'dice': DiceLoss(),
-                          'focls': FoclssLoss()
+                          'focls': FocalLoss()
                      }  
                    )
 

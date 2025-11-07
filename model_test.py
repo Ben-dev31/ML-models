@@ -2,7 +2,7 @@
 import os
 from typing import Optional, Tuple
 from unet import UNet
-from losses_metrics import DiceLoss, dice_coeff, iou_score
+from losses_metrics import dice_coeff, iou_score
 import torch
 from pathlib import Path
 from PIL import Image

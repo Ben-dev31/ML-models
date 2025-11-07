@@ -3,8 +3,9 @@ import traceback
 import torch
 from torch.utils.data import DataLoader
 from pathlib import Path
-from unet import UNet, SegmentationDataset
+from unet import UNet
 from losses_metrics import DiceLoss
+from utils import SegmentationDataset
 
 
 def run_full_train(root='./data', epochs=1, batch_size=2, device=None,
