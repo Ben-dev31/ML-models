@@ -9,7 +9,9 @@ from losses_metrics import DiceLoss
 
 def run_full_train(root='./data', epochs=1, batch_size=2, device=None,
                     train_dir: str = None, val_dir: str = None, target_size: tuple = (256, 256),
-                    criterion=None, save_dir: str = "./model_checkpoints"):
+                    criterion=None, save_dir: str = "./model_checkpoints",
+                    history_path: str = "training_history.json"):
+    
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Quick train on device: {device}")
 
@@ -43,7 +45,8 @@ def run_full_train(root='./data', epochs=1, batch_size=2, device=None,
 
     try:
         model.train_model(train_loader, val_loader, epochs=epochs, lr=1e-3,
-                           criterion=criterion, save_dir=save_dir)
+                           criterion=criterion, save_dir=save_dir, 
+                           save_history_path=history_path)
         print('training completed successfully.')
     except Exception:
         print('training failed with exception:')

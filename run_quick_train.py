@@ -11,9 +11,9 @@ from PIL import Image, ImageDraw
 import torch
 from torch.utils.data import DataLoader
 
-from unet import UNet, SegmentationDataset
+from unet import UNet
 from losses_metrics import DiceLoss
-from utils import make_dirs
+from utils import *
 
 
 def generate_synthetic_pairs(out_images_dir, out_masks_dir, n=4, size=(256, 256)):

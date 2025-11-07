@@ -1,7 +1,7 @@
 
 import os
 from typing import Optional, Tuple
-from unet import UNet, SegmentationDataset
+from unet import UNet
 from losses_metrics import DiceLoss, dice_coeff, iou_score
 import torch
 from pathlib import Path
@@ -9,96 +9,18 @@ from PIL import Image
 import numpy as np
 from torch.utils.data import DataLoader
 from torchvision import transforms
+from utils import PredictionDataset, save_in_history
 
 
-class PredictionDataset(torch.utils.data.Dataset):
-    """Loads images from a directory and returns (tensor, filename)."""
-    def __init__(self, images_dir: str, transform=None, target_size: Optional[Tuple[int,int]] = None):
-        self.images_dir = Path(images_dir)
-        if not self.images_dir.exists():
-            raise FileNotFoundError(f"Images dir not found: {self.images_dir}")
-        valid_exts = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
-        self.files = sorted([p.name for p in self.images_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts])
-        if transform:
-            self.transform = transform
-        else:
-            if target_size:
-                self.transform = transforms.Compose([transforms.Resize(target_size), transforms.ToTensor()])
-            else:
-                self.transform = transforms.ToTensor()
 
-    def __len__(self):
-        return len(self.files)
-
-    def __getitem__(self, idx):
-        fname = self.files[idx]
-        img_path = self.images_dir / fname
-        img = Image.open(img_path).convert('RGB')
-        img_t = self.transform(img)
-        return img_t, fname
-
-def validate_prediction(ground_truth_dir: str, predicted_masks_dir: str):
-    """Compare predicted mask files to ground-truth masks in a folder-by-folder manner.
-
-    Both folders should contain mask images with matching filenames (or at least matching stems).
-    Returns a dict with average 'dice' and 'iou'.
-    """
-    gt_dir = Path(ground_truth_dir)
-    pred_dir = Path(predicted_masks_dir)
-    if not gt_dir.exists():
-        raise FileNotFoundError(f"Ground-truth directory not found: {gt_dir}")
-    if not pred_dir.exists():
-        raise FileNotFoundError(f"Predicted masks directory not found: {pred_dir}")
-
-    valid_exts = {'.png', '.jpg', '.jpeg', '.tif', '.tiff', '.bmp'}
-    pred_files = sorted([p for p in pred_dir.iterdir() if p.is_file() and p.suffix.lower() in valid_exts])
-    if len(pred_files) == 0:
-        raise ValueError(f"No predicted mask files found in {pred_dir}")
-
-    total_dice = 0.0
-    total_iou = 0.0
-    n = 0
-
-    for p in pred_files:
-        stem = p.stem
-        # find gt mask by same stem
-        gt_file = None
-        for g in gt_dir.iterdir():
-            if g.is_file() and g.stem == stem:
-                gt_file = g
-                break
-        if gt_file is None:
-            # skip if no matching gt
-            print(f"Warning: ground-truth mask for {p.name} not found in {gt_dir}, skipping")
-            continue
-
-        pred_img = Image.open(p).convert('L')
-        gt_img = Image.open(gt_file).convert('L')
-
-        # resize gt to pred size if needed
-        if pred_img.size != gt_img.size:
-            gt_img = gt_img.resize(pred_img.size, resample=Image.NEAREST)
-
-        pred_t = transforms.ToTensor()(pred_img)  # [1,H,W]
-        gt_t = transforms.ToTensor()(gt_img)
-
-        # ensure 0..1 floats
-        # compute metrics (wrap in batch dim)
-        dice = float(dice_coeff(pred_t.unsqueeze(0), gt_t.unsqueeze(0)).item())
-        iou = float(iou_score(pred_t.unsqueeze(0), gt_t.unsqueeze(0), thr=0.5).item())
-
-        total_dice += dice
-        total_iou += iou
-        n += 1
-
-    if n == 0:
-        raise ValueError("No mask pairs found to evaluate.")
-
-    avg = {'dice': total_dice / n, 'iou': total_iou / n, 'n': n}
-    print(f"Validation over {n} masks: Dice={avg['dice']:.4f}, IoU={avg['iou']:.4f}")
-    return avg
-
-def run_prediction(model_path: str, images_dir: str, out_masks_dir: str, device=None, batch_size=2, target_size: Optional[Tuple[int,int]] = None):
+def run_prediction(model_path: str, images_dir: str, 
+                   out_masks_dir: str, 
+                   device=None, 
+                   batch_size=2, 
+                   target_size: Optional[Tuple[int,int]] = None,
+                   metrics: Optional[dict] = None,
+                   histrory_path: Optional[str] = "prediction_history.json"
+                   ):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Running prediction on device: {device}")
 
@@ -141,19 +63,36 @@ def run_prediction(model_path: str, images_dir: str, out_masks_dir: str, device=
     gt_masks_dir = Path(images_dir).parent / 'masks'
     if gt_masks_dir.exists():
         print("Ground-truth masks directory found, running evaluation...")
-        evaluate_model(model_path, images_dir, str(gt_masks_dir), device=device, batch_size=batch_size, target_size=model_target)
+        evaluate_model(model_path, images_dir, 
+                       str(gt_masks_dir), 
+                       device=device, 
+                       batch_size=batch_size, 
+                       target_size=model_target,
+                       metrics=metrics,
+                       history_path=histrory_path
+                       )
     
     print(f"Prediction completed. Masks saved to {out_masks_dir}")
 
 
-def evaluate_model(model_path: str, images_dir: str, masks_dir: str, device=None, batch_size: int = 4, threshold: float = 0.5, target_size: Optional[Tuple[int,int]] = None):
+def evaluate_model(model_path: str, 
+                   images_dir: str,
+                    masks_dir: str, 
+                    device=None, 
+                   batch_size: int = 4, 
+                   threshold: float = 0.5, 
+                   target_size: Optional[Tuple[int,int]] = None,
+                   metrics: Optional[dict] = None,
+                   save_results: bool = True,
+                   history_path: Optional[str] = "loss_history.json"
+                   ):
     """Evaluate model predictions against ground-truth masks.
 
     Returns average Dice and IoU across dataset.
     """
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Evaluating model on device: {device}")
-
+    history = {}
     # load model
     model = UNet(in_channels=3, out_channels=1)
     ckpt = torch.load(model_path, map_location=device)
@@ -209,16 +148,28 @@ def evaluate_model(model_path: str, images_dir: str, masks_dir: str, device=None
             targets = torch.stack(targets, dim=0).to(device)
 
             # compute metrics
-            dice = dice_coeff(probs, targets).item()
-            iou = iou_score(probs, targets, thr=threshold).item()
-            total_dice += dice * b
-            total_iou += iou * b
-            n += b
+            if metrics is None or 'dice' in metrics:
+                dice = dice_coeff(probs, targets).item()
+                iou = iou_score(probs, targets, thr=threshold).item()
+                total_dice += dice * b
+                total_iou += iou * b
+                n += b
+                history['dice'] = history.get('dice', 0.0) + dice * b
+                history['iou'] = history.get('iou', 0.0) + iou * b
 
-    avg_dice = total_dice / max(1, n)
-    avg_iou = total_iou / max(1, n)
-    print(f"Evaluation: n={n}  Dice={avg_dice:.4f}  IoU={avg_iou:.4f}")
-    return avg_dice, avg_iou
+            else:
+                for metric_name, metric_fn in metrics.items():
+                    score = metric_fn(probs, targets, thr = threshold).item()
+                    history[metric_name] = history.get(metric_name, 0.0) + score * b
+
+    for key in history:
+        history[key] = history[key] / max(1, n) 
+    
+    if save_results or history_path:
+        save_in_history(history, history_path)
+        print(f"Saved evaluation results to {history_path}")
+
+    print(f"Evaluation completed over {n} samples. Results: {history}")
 
 
 if __name__ == "__main__":
