@@ -13,15 +13,7 @@ from torch.utils.data import DataLoader
 
 from unet import UNet, SegmentationDataset
 from losses_metrics import DiceLoss
-
-
-def make_dirs(base):
-    p = Path(base)
-    imgs = p / 'images'
-    masks = p / 'masks'
-    imgs.mkdir(parents=True, exist_ok=True)
-    masks.mkdir(parents=True, exist_ok=True)
-    return imgs, masks
+from utils import make_dirs
 
 
 def generate_synthetic_pairs(out_images_dir, out_masks_dir, n=4, size=(256, 256)):

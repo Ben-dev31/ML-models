@@ -195,12 +195,7 @@ class UNet(nn.Module):
             self.history.setdefault('val_loss', []).append(val_loss)
 
             # checkpoint dict (compatible with load_checkpoint below)
-            ckpt = {
-                'epoch': epoch + 1,
-                'model_state': self.state_dict(),
-                'opt_state': optimizer.state_dict(),
-                'val_loss': val_loss
-            }
+           
             ckpt_path = save_dir / f"unet_epoch{epoch+1}.pth"
             torch.save(self.state_dict(), ckpt_path)
 
@@ -279,7 +274,7 @@ class UNet(nn.Module):
         return img_tensor
 
     
-    def predict(self, image_input, threshold=0.5, return_numpy: bool = True, color_order: str = 'RGB'):
+    def predict(self, image_input, color_order: str = 'RGB') -> Any:
         """
         Prédit un masque à partir d'une image.
         Accepte :
@@ -294,11 +289,8 @@ class UNet(nn.Module):
 
             output = self(img_tensor)
             probs = torch.sigmoid(output)
-            mask = (probs > threshold).float()
-        mask = mask.cpu().squeeze(0)  # remove batch dim; shape [C,H,W] or [H,W] if C==1
-        if return_numpy:
-            return mask.squeeze().numpy()
-        return mask
+           
+            return probs
 
 
 
@@ -372,27 +364,6 @@ def make_basic_transform(target_size: Tuple[int,int]=(256,256)):
         transforms.ToTensor(),  # image -> [C,H,W] float 0..1
     ])
 # If you want synchronized augmentations for image+mask, prefer albumentations (not used here).
-
-
-def validate(model, loader, device, metric):
-    model.eval()
-    val_loss = 0.0
-    metric_meter = 0.0
-    iou_meter = 0.0
-    with torch.no_grad():
-        for images, masks in loader:
-            images = images.to(device, dtype=torch.float32)
-            masks = masks.to(device, dtype=torch.float32)
-            logits = model(images)
-            loss = metric(logits, masks) 
-            val_loss += loss.item()
-
-            probs = torch.sigmoid(logits)
-            metric_meter += metric(probs, masks).item()
-
-    n = len(loader)
-    return val_loss / n, metric_meter / n, iou_meter / n
-
 
 def load_checkpoint(model: nn.Module, ckpt_path: str, optimizer: Optional[torch.optim.Optimizer]=None, scaler: Optional[GradScaler]=None):
     ckpt = torch.load(ckpt_path, map_location='cpu')
