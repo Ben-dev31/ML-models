@@ -9,7 +9,7 @@ from losses_metrics import DiceLoss
 
 def run_full_train(root='./data', epochs=1, batch_size=2, device=None,
                     train_dir: str = None, val_dir: str = None, target_size: tuple = (256, 256),
-                    criterion=None):
+                    criterion=None, save_dir: str = "./model_checkpoints"):
     device = device or ('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"Quick train on device: {device}")
 
@@ -42,7 +42,8 @@ def run_full_train(root='./data', epochs=1, batch_size=2, device=None,
     criterion = criterion or DiceLoss()
 
     try:
-        model.train_model(train_loader, val_loader, epochs=epochs, lr=1e-3, criterion=criterion)
+        model.train_model(train_loader, val_loader, epochs=epochs, lr=1e-3,
+                           criterion=criterion, save_dir=save_dir)
         print('training completed successfully.')
     except Exception:
         print('training failed with exception:')
@@ -59,7 +60,7 @@ if __name__ == '__main__':
     parser.add_argument('--train-dir', type=str, required=True, help='Path to the training data directory.')
     parser.add_argument('--val-dir', type=str, required=True, help='Path to the validation data directory.')
     parser.add_argument('--target-size', type=int, nargs=2, default=(256, 256), help='Target size (height width) for images.')
-
+    parser.add_argument('--save-dir', type=str, default='./model_checkpoints', help='Directory to save model checkpoints.') 
     args = parser.parse_args()
 
     run_full_train(root=args.root,
