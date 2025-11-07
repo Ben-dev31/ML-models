@@ -49,7 +49,9 @@ def evaluate_model(data_path: str,
         # plot training history
         loss_file = str(Path(data_path).parent / f'training_history_{loss_name}.json')
         train_losses, val_losses = load_loss_history(loss_file)
-        plot_loss(train_losses, val_losses, out_path=str(Path(data_path).parent / f'loss_plot_{loss_name}.png'))
+        plot_loss(train_losses, val_losses, 
+                  out_path=str(Path(data_path).parent / f'loss_plot_{loss_name}.png'),
+                  metric_name=loss_name)
 
         # test prediction
         model_ckpt = str(Path(data_path).parent.joinpath(f'model_checkpoints-{loss_name}/unet_epoch{epochs -1}.pth'))
@@ -65,7 +67,23 @@ def evaluate_model(data_path: str,
         
     print("Evaluation completed.")
 
-
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Evaluate model on dataset with different loss functions.")
+    parser.add_argument('--data-path', type=str, required=True, help='Path to dataset directory.')
+    parser.add_argument('--epochs', type=int, default=5, help='Number of training epochs.')
+    parser.add_argument('--batch-size', type=int, default=2, help='Batch size for training.')
+    parser.add_argument('--device', type=str, default=None, help='Device to use for training (e.g., "cuda" or "cpu").')     
+    args = parser.parse_args()
+    evaluate_model(data_path=args.data_path,
+                   epochs=args.epochs,
+                   batch_size=args.batch_size,
+                   device=args.device,
+                     loss_fns={
+                          'dice': DiceLoss(),
+                          'focls': FoclssLoss()
+                     }  
+                   )
 
 
    

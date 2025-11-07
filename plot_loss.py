@@ -17,7 +17,7 @@ def load_loss_history(loss_file):
 
     return train_losses, val_losses  
 
-def plot_loss(train_losses, val_losses, out_path='loss_plot.png'):
+def plot_loss(train_losses, val_losses, out_path='loss_plot.png', metric_name='dice'):
     """Plot training and validation loss curves and save to a file.
 
     Args:
@@ -30,7 +30,7 @@ def plot_loss(train_losses, val_losses, out_path='loss_plot.png'):
     plt.figure(figsize=(10, 6))
     plt.plot(epochs, train_losses, label='Training Loss', color='blue', marker='o')
     plt.plot(epochs, val_losses, label='Validation Loss', color='orange', marker='o')
-    plt.title('Training and Validation Loss over Epochs')
+    plt.title(f'Training and Validation Loss over Epochs ({metric_name})')
     plt.xlabel('Epochs')
     plt.ylabel('Loss')
     plt.xticks(epochs)
